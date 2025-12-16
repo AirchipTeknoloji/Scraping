@@ -418,3 +418,38 @@ class Notification(Base):
     
     def __repr__(self):
         return f'<Notification {self.title} for User:{self.user_id}>'
+
+# models_standalone.py dosyasının EN SONUNA ekle:
+
+# ============================================
+# DATABASE UTILITIES
+# ============================================
+
+def get_db_engine():
+    """Database engine oluştur"""
+    import os
+    DATABASE_URL = os.getenv('DATABASE_URL')
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is not set!")
+    
+    from sqlalchemy import create_engine
+    return create_engine(
+        DATABASE_URL,
+        pool_size=20,
+        max_overflow=30,
+        pool_pre_ping=True,
+        echo=False
+    )
+
+def get_session():
+    """Database session oluştur"""
+    from sqlalchemy.orm import sessionmaker
+    engine = get_db_engine()
+    Session = sessionmaker(bind=engine)
+    return Session()
+
+def init_db():
+    """Tüm tabloları oluştur (ilk kurulumda)"""
+    engine = get_db_engine()
+    Base.metadata.create_all(engine)
+    print("✅ Database tables created successfully!")
