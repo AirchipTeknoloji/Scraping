@@ -1,5 +1,5 @@
 # scraper_worker/requirements.txt
 requests==2.31.0
-sqlalchemy==2.0.23
-psycopg2-binary==2.9.9
+sqlalchemy==2.0.40
+psycopg2-binary==2.9.10
 python-dotenv==1.0.0
