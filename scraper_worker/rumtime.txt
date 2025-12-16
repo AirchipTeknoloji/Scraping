@@ -1,0 +1,2 @@
+# scraper_worker/runtime.txt
+python-3.11.6
