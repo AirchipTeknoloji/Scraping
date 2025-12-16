@@ -1,30 +1,36 @@
-# scraper_worker/main.py - BAN TESPİTİ EKLE
-
-import os
-import sys
+# scraper_worker/main.py (FULL VERSION)
+import requests
+import json
 from datetime import datetime, date, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 import logging
+import os
+import time
 
-# Logging konfigürasyonu - STDOUT'a yaz (DigitalOcean logları görebilmek için)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)  # STDOUT'a yaz
-    ]
+
+import sys
+
+
+# Models import
+from models_standalone import (
+    Route, Journey, PriceHistory, PriceAlert, 
+    CompanyRoute, User, get_session
 )
-logger = logging.getLogger(__name__)
+
+# Logging setup
+#logging.basicConfig(
+#    level=logging.INFO,
+#    format='%(asctime)s - %(levelname)s - %(message)s'
+#)
+#logger = logging.getLogger(__name__)
+
+# ScrapingBee API Key
+API_KEY = os.getenv('SCRAPINGBEE_API_KEY', '85KGJQAG8QSNBIQ4UNK8J3M6H57NBN8L9H6V7KFK8HXJKB2X1G6JK9JFKUX121W1ZRN9CVO9OZEXIWLE')
 
 
-class ScrapingBeeMonitor:
-    """ScrapingBee ban/block tespiti"""
-    
-    def __init__(self):# scraper_worker/main.py - BAN TESPİTİ EKLE
 
-import os
-import sys
-from datetime import datetime, date, timedelta, timezone
-import logging
+
 
 # Logging konfigürasyonu - STDOUT'a yaz (DigitalOcean logları görebilmek için)
 logging.basicConfig(
@@ -97,16 +103,41 @@ class ScrapingBeeMonitor:
         return self.get_block_rate() > 20 or self.rate_limited > 5
 
 
+
+
 class ObiletScraper:
     def __init__(self, max_workers=10, max_retries=3, batch_size=500):
-        # ... mevcut init kodu ...
+        self.max_workers = max_workers
+        self.max_retries = max_retries
+        self.batch_size = batch_size
         
-        # Ban monitoring ekle
+        # Buffers - memory'de biriktir
+        self.scraped_data = []  # Tüm scrape edilen journeys
+        self.lock = Lock()
+        
+        # Statistics
+        self.total_routes = 0
+        self.completed_routes = 0
+        self.failed_routes = 0
+        self.total_journeys = 0
         self.ban_monitor = ScrapingBeeMonitor()
+        
+    def get_active_routes(self):
+        """Database'den aktif route'ları çek"""
+        session = get_session()
+        try:
+            routes = session.query(Route).filter_by(is_active=True).all()
+            logger.info(f"📋 Found {len(routes)} active routes in database")
+            return routes
+        except Exception as e:
+            logger.error(f"❌ Database error: {e}")
+            return []
+        finally:
+            session.close()
     
     def get_obilet_journeys(self, origin_id, destination_id, date_str):
         """
-        Obilet JSON endpoint'inden seferleri çeker (BAN TESPİTİ İLE)
+        Obilet JSON endpoint'inden seferleri çeker (ScrapingBee ile)
         """
         url = f"https://www.obilet.com/json/journeys/{origin_id}-{destination_id}/{date_str}"
         
@@ -129,25 +160,79 @@ class ObiletScraper:
                 headers=headers,
                 timeout=30
             )
-            
-            # ❗ BAN TESPİTİ
+
             self.ban_monitor.record_request(response)
-            
+
             if response.status_code != 200:
-                logger.error(f"❌ ScrapingBee error: {response.status_code} - {response.text[:200]}")
+                logger.error(f"❌ ScrapingBee error: {response.status_code}")
                 return []
             
             data = response.json()
             journeys = data.get('journeys', [])
             
-            # ... mevcut parse kodu ...
+            parsed_journeys = []
+            
+            for j in journeys:
+                journey = j.get('journey', {})
+                
+                parsed = {
+                    'id': j.get('id'),
+                    'partner_id': j.get('partner-id'),
+                    'partner_name': j.get('partner-name'),
+                    'bus_type': j.get('bus-type'),
+                    'total_seats': j.get('total-seats'),
+                    'available_seats': j.get('available-seats'),
+                    
+                    # Journey detayları
+                    'origin': journey.get('origin'),
+                    'destination': journey.get('destination'),
+                    'departure': journey.get('departure'),
+                    'arrival': journey.get('arrival'),
+                    'duration': journey.get('duration'),
+                    
+                    # Fiyat
+                    'original_price': journey.get('original-price'),
+                    'internet_price': journey.get('internet-price'),
+                    'currency': journey.get('currency'),
+                    
+                    # Diğer bilgiler
+                    'bus_name': journey.get('bus-name'),
+                    'peron_no': journey.get('peron-no'),
+                    
+                    # Özellikler
+                    'features': [f.get('name') for f in j.get('features', [])],
+                    
+                    # Duraklar
+                    'stops': [
+                        {
+                            'name': stop.get('name'),
+                            'time': stop.get('time'),
+                            'is_origin': stop.get('is-origin'),
+                            'is_destination': stop.get('is-destination')
+                        }
+                        for stop in journey.get('stops', [])
+                    ],
+                    
+                    # Rating
+                    'partner_rating': j.get('partner-rating'),
+                    'partner_route_rating': j.get('partner-route-rating'),
+                }
+                
+                parsed_journeys.append(parsed)
             
             return parsed_journeys
             
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             logger.error(f"❌ Request error: {e}")
             return []
-    
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ JSON parse error: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"❌ Unexpected error: {e}")
+            return 
+
+
     def send_ban_alert(self):
         """Ban/block alerti gönder"""
         from models_standalone import Notification, User
@@ -184,293 +269,586 @@ Action may be required!
             logger.error(f"❌ Failed to send ban alert: {e}")
         finally:
             session.close()
-    
-    def run(self, target_date=None, cleanup_old_data=False):
-        """
-        Ana scraping fonksiyonu (BAN TESPİTİ İLE)
-        """
-        logger.info("=" * 80)
-        logger.info("🚀 Obilet Scraper Starting...")
-        logger.info(f"📅 Timestamp: {datetime.utcnow().isoformat()}")
-        logger.info("=" * 80)
-        
-        start_time = time.time()
-        
-        # ... mevcut scraping kodu ...
-        
-        # Scraping tamamlandı - ban kontrolü
-        if self.ban_monitor.should_alert():
-            logger.error("🚨 HIGH BLOCK RATE DETECTED!")
-            self.send_ban_alert()
-        
-        # Final statistics
-        elapsed = time.time() - start_time
-        
-        logger.info("=" * 80)
-        logger.info("✅ Scraper Completed!")
-        logger.info(f"   Duration: {elapsed:.1f}s")
-        logger.info(f"   Routes Processed: {self.completed_routes}/{self.total_routes}")
-        logger.info(f"   Routes Failed: {self.failed_routes}")
-        logger.info(f"   Total Journeys Scraped: {self.total_journeys}")
-        logger.info("")
-        logger.info("   📊 Database Changes:")
-        logger.info(f"      Inserted: {total_inserted}")
-        logger.info(f"      Updated: {total_updated}")
-        logger.info(f"      Deleted: {total_deleted}")
-        logger.info(f"      Price Changes: {total_price_changes}")
-        logger.info("")
-        logger.info("   🛡️  ScrapingBee Status:")
-        logger.info(f"      Total Requests: {self.ban_monitor.total_requests}")
-        logger.info(f"      Failed: {self.ban_monitor.failed_requests}")
-        logger.info(f"      Blocked: {self.ban_monitor.blocked_requests}")
-        logger.info(f"      Block Rate: {self.ban_monitor.get_block_rate():.1f}%")
-        logger.info("=" * 80)
-        
-        return self.scraped_data
 
 
-if __name__ == '__main__':
-    # Database URL check
-    DATABASE_URL = os.getenv('DATABASE_URL')
-    
-    if not DATABASE_URL:
-        logger.error("❌ DATABASE_URL environment variable not set!")
-        sys.exit(1)
-    
-    logger.info(f"✅ DATABASE_URL configured")
-    logger.info(f"✅ SCRAPINGBEE_API_KEY configured: {'Yes' if os.getenv('SCRAPINGBEE_API_KEY') else 'No'}")
-    
-    try:
-        # Scraper çalıştır
-        scraper = ObiletScraper(
-            max_workers=10,
-            max_retries=3,
-            batch_size=500
-        )
-        
-        # Bugün için scrape et
-        scraped_data = scraper.run(cleanup_old_data=True)
-        
-        logger.info("\n🎉 All operations completed successfully!")
-        sys.exit(0)  # Success
-        
-    except Exception as e:
-        logger.error(f"💥 FATAL ERROR: {e}", exc_info=True)
-        sys.exit(1)  # Failure
-
-        self.total_requests = 0
-        self.failed_requests = 0
-        self.blocked_requests = 0
-        self.rate_limited = 0
-    
-    def is_blocked_response(self, response):
-        """Response blocked/banned mi kontrol et"""
-        
-        # Status code kontrolü
-        if response.status_code in [403, 429]:  # Forbidden, Too Many Requests
-            return True
-        
-        # ScrapingBee specific errors
-        if response.status_code == 422:  # ScrapingBee error
-            return True
-        
-        # Response body kontrolü
-        try:
-            data = response.json()
+    def buffer_journeys(self, route, journeys, date_str):
+        """Thread-safe buffer'a ekle"""
+        with self.lock:
+            for journey in journeys:
+                # Route bilgisini de ekle
+                journey['route_id'] = route.id
+                journey['route_name'] = route.route_name or f"{route.origin_city_name} - {route.destination_city_name}"
+                journey['scraped_date'] = date_str
+                journey['scraped_at'] = datetime.utcnow().isoformat()
+                
+                self.scraped_data.append(journey)
             
-            # ScrapingBee error mesajları
-            if 'error' in data:
-                error_msg = str(data['error']).lower()
-                if any(keyword in error_msg for keyword in ['blocked', 'banned', 'captcha', 'rate limit']):
-                    return True
+            self.total_journeys += len(journeys)
+    
+    def parse_datetime_safe(self, datetime_str):
+        """
+        Datetime string'i parse et, timezone ekle
+        """
+        if not datetime_str:
+            return None
+        
+        try:
+            # ISO format parse et
+            dt = datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
+            
+            # Timezone yoksa UTC ekle
+            if dt.tzinfo is None:
+                from datetime import timezone
+                dt = dt.replace(tzinfo=timezone.utc)
+            
+            return dt
         except:
-            pass
-        
-        return False
-    
-    def record_request(self, response):
-        """Request sonucunu kaydet"""
-        self.total_requests += 1
-        
-        if response.status_code != 200:
-            self.failed_requests += 1
-        
-        if self.is_blocked_response(response):
-            self.blocked_requests += 1
-            logger.warning(f"⚠️  BLOCKED RESPONSE: Status {response.status_code}")
-        
-        if response.status_code == 429:
-            self.rate_limited += 1
-    
-    def get_block_rate(self):
-        """Block oranını hesapla"""
-        if self.total_requests == 0:
-            return 0
-        return (self.blocked_requests / self.total_requests) * 100
-    
-    def should_alert(self):
-        """Alert gönderilmeli mi?"""
-        # %20'den fazla block varsa alert
-        return self.get_block_rate() > 20 or self.rate_limited > 5
+            try:
+                # Alternatif format
+                dt = datetime.strptime(datetime_str, '%Y-%m-%dT%H:%M:%S')
+                from datetime import timezone
+                dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except:
+                logger.warning(f"⚠️  Could not parse datetime: {datetime_str}")
+                return None
 
+    def filter_journeys_by_date(self, journeys, target_date):
+        """
+        Sadece target_date'e ait journey'leri filtrele
+        Ertesi günün seferlerini exclude et
+        """
+        filtered = []
+        excluded_count = 0
+        
+        for journey in journeys:
+            departure_str = journey.get('departure')
+            
+            if not departure_str:
+                continue
+            
+            # Parse et
+            departure_dt = self.parse_datetime_safe(departure_str)
+            
+            if not departure_dt:
+                continue
+            
+            # Tarihi karşılaştır (sadece date kısmı)
+            journey_date = departure_dt.date()
+            
+            if journey_date == target_date:
+                filtered.append(journey)
+            else:
+                excluded_count += 1
+                logger.debug(f"  ⏭️  Excluded: {journey.get('partner_name')} @ {departure_dt} (different date)")
+        
+        if excluded_count > 0:
+            logger.info(f"  📅 Filtered: {len(filtered)} kept, {excluded_count} excluded (wrong date)")
+        
+        return filtered
 
-class ObiletScraper:
-    def __init__(self, max_workers=10, max_retries=3, batch_size=500):
-        # ... mevcut init kodu ...
-        
-        # Ban monitoring ekle
-        self.ban_monitor = ScrapingBeeMonitor()
-    
-    def get_obilet_journeys(self, origin_id, destination_id, date_str):
+    def scrape_route_with_retry(self, route, date_str):
         """
-        Obilet JSON endpoint'inden seferleri çeker (BAN TESPİTİ İLE)
+        Tek bir route için scraping yap (GÜNCELLENMİŞ)
         """
-        url = f"https://www.obilet.com/json/journeys/{origin_id}-{destination_id}/{date_str}"
+        route_name = route.route_name or f"{route.origin_city_name} → {route.destination_city_name}"
         
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json',
-            'Referer': 'https://www.obilet.com/'
-        }
+        for attempt in range(self.max_retries):
+            try:
+                # Obilet'ten veri çek
+                journeys = self.get_obilet_journeys(
+                    origin_id=route.origin_obilet_id,
+                    destination_id=route.destination_obilet_id,
+                    date_str=date_str
+                )
+                
+                if journeys:
+                    # Target date objesini oluştur
+                    target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    
+                    # ❗ SADECE O GÜNÜN SEFERLERİNİ FİLTRELE
+                    filtered_journeys = self.filter_journeys_by_date(journeys, target_date)
+                    
+                    if filtered_journeys:
+                        # Buffer'a ekle
+                        self.buffer_journeys(route, filtered_journeys, date_str)
+                        
+                        with self.lock:
+                            self.completed_routes += 1
+                        
+                        logger.info(f"✅ [{self.completed_routes}/{self.total_routes}] {route_name}: {len(filtered_journeys)} journeys (filtered from {len(journeys)})")
+                        return {'success': True, 'count': len(filtered_journeys)}
+                    else:
+                        logger.warning(f"⚠️  {route_name}: All journeys excluded (wrong date)")
+                        with self.lock:
+                            self.completed_routes += 1
+                        return {'success': True, 'count': 0}
+                else:
+                    logger.warning(f"⚠️  {route_name}: No journeys found")
+                    with self.lock:
+                        self.completed_routes += 1
+                    return {'success': True, 'count': 0}
+                
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    logger.error(f"❌ {route_name} failed after {self.max_retries} attempts: {e}")
+                    with self.lock:
+                        self.failed_routes += 1
+                    return {'success': False, 'error': str(e)}
+                
+                wait_time = 2 ** attempt
+                logger.warning(f"⟳ {route_name} attempt {attempt + 1}/{self.max_retries} failed, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+
+    def create_journey_object(self, data):
+        """
+        Scraped data'dan Journey objesi oluştur (GÜNCELLENMİŞ)
+        """
+        # ❗ YENİ PARSE FONKSİYONU KULLAN
+        departure_dt = self.parse_datetime_safe(data.get('departure'))
+        arrival_dt = self.parse_datetime_safe(data.get('arrival'))
         
-        try:
-            response = requests.post(
-                "https://app.scrapingbee.com/api/v1/",
-                params={
-                    "api_key": API_KEY,
-                    "url": url,
-                    "country_code": "tr",
-                    "render_js": False,
-                    "premium_proxy": True,
-                },
-                headers=headers,
-                timeout=30
-            )
-            
-            # ❗ BAN TESPİTİ
-            self.ban_monitor.record_request(response)
-            
-            if response.status_code != 200:
-                logger.error(f"❌ ScrapingBee error: {response.status_code} - {response.text[:200]}")
-                return []
-            
-            data = response.json()
-            journeys = data.get('journeys', [])
-            
-            # ... mevcut parse kodu ...
-            
-            return parsed_journeys
-            
-        except Exception as e:
-            logger.error(f"❌ Request error: {e}")
-            return []
-    
-    def send_ban_alert(self):
-        """Ban/block alerti gönder"""
-        from models_standalone import Notification, User
+        # Occupancy rate hesapla
+        occupancy_rate = None
+        if data.get('total_seats') and data['total_seats'] > 0:
+            occupied = data['total_seats'] - data.get('available_seats', 0)
+            occupancy_rate = round((occupied / data['total_seats']) * 100, 2)
         
+        return Journey(
+            route_id=data['route_id'],
+            company_name=data.get('partner_name', 'Unknown'),
+            obilet_partner_id=data.get('partner_id'),
+            departure_time=departure_dt,
+            arrival_time=arrival_dt,
+            duration=data.get('duration'),
+            original_price=data.get('original_price'),
+            internet_price=data.get('internet_price'),
+            currency=data.get('currency', 'TRY'),
+            total_seats=data.get('total_seats'),
+            available_seats=data.get('available_seats', 0),
+            occupancy_rate=occupancy_rate,
+            bus_type=data.get('bus_type'),
+            bus_plate=data.get('bus_name'),
+            has_wifi='Wifi' in data.get('features', []) or 'Wi-Fi' in data.get('features', []),
+            has_usb='USB' in data.get('features', []),
+            has_tv='TV' in data.get('features', []) or 'Ekran' in data.get('features', []),
+            has_socket='Priz' in data.get('features', []) or 'Şarj' in data.get('features', []),
+            obilet_journey_id=data.get('id'),
+            is_active=True
+        )
+
+    def sync_journeys_for_route(self, route_id, new_journeys_data, target_date):
+        """
+        Bir route için journey'leri senkronize et (GÜNCELLENMİŞ)
+        """
         session = get_session()
         
         try:
-            # Admin kullanıcıları bul
-            admins = session.query(User).filter_by(role='admin', is_active=True).all()
+            # ❗ DATETIME RANGE DÜZELT
+            # Target date'in başlangıcı ve bitişi (timezone-aware)
+            from datetime import timezone
+            start_of_day = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+            end_of_day = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=timezone.utc)
             
-            for admin in admins:
-                notification = Notification(
-                    user_id=admin.id,
-                    title="⚠️ ScrapingBee Blocking Detected!",
-                    message=f"""
-Scraper is experiencing high block rates:
-- Total Requests: {self.ban_monitor.total_requests}
-- Blocked: {self.ban_monitor.blocked_requests}
-- Block Rate: {self.ban_monitor.get_block_rate():.1f}%
-- Rate Limited: {self.ban_monitor.rate_limited}
-
-Action may be required!
-                    """.strip(),
-                    notification_type='error',
-                    priority='high',
-                    is_read=False
+            # 1. DB'den o route + tarih için mevcut journeys'i çek
+            existing_journeys = session.query(Journey).filter(
+                Journey.route_id == route_id,
+                Journey.departure_time >= start_of_day,
+                Journey.departure_time <= end_of_day,
+                Journey.is_active == True
+            ).all()
+            
+            # Existing journeys'i key'e göre dict'e çevir
+            existing_dict = {}
+            for j in existing_journeys:
+                key = (
+                    j.route_id,
+                    j.departure_time.isoformat() if j.departure_time else None,
+                    j.obilet_partner_id
                 )
-                session.add(notification)
+                existing_dict[key] = j
+            
+            # New journeys'i key'e göre dict'e çevir
+            new_dict = {}
+            for data in new_journeys_data:
+                key = self.get_unique_key(data)
+                new_dict[key] = data
+            
+            existing_keys = set(existing_dict.keys())
+            new_keys = set(new_dict.keys())
+            
+            # ... geri kalan sync logic aynı ...
+            
+            # 2. Silinecekler
+            to_delete_keys = existing_keys - new_keys
+            deleted_count = 0
+            
+            for key in to_delete_keys:
+                journey = existing_dict[key]
+                journey.is_active = False
+                deleted_count += 1
+                logger.info(f"  🗑️  Deleted: {journey.company_name} @ {journey.departure_time.strftime('%H:%M') if journey.departure_time else 'N/A'}")
+            
+            # 3. Güncellenecekler
+            to_update_keys = existing_keys & new_keys
+            updated_count = 0
+            price_changes = []
+            
+            for key in to_update_keys:
+                existing_journey = existing_dict[key]
+                new_data = new_dict[key]
+                
+                new_price = new_data.get('internet_price')
+                new_seats = new_data.get('available_seats', 0)
+                
+                old_price = existing_journey.internet_price
+                price_changed = old_price and new_price and old_price != new_price
+                seats_changed = existing_journey.available_seats != new_seats
+                
+                if price_changed or seats_changed:
+                    existing_journey.internet_price = new_price
+                    existing_journey.original_price = new_data.get('original_price')
+                    existing_journey.available_seats = new_seats
+                    existing_journey.total_seats = new_data.get('total_seats')
+                    
+                    if new_data.get('total_seats') and new_data['total_seats'] > 0:
+                        occupied = new_data['total_seats'] - new_seats
+                        existing_journey.occupancy_rate = round((occupied / new_data['total_seats']) * 100, 2)
+                    
+                    existing_journey.scraped_at = datetime.utcnow()
+                    updated_count += 1
+                    
+                    if price_changed:
+                        change_pct = ((new_price - old_price) / old_price) * 100
+                        price_changes.append({
+                            'journey': existing_journey,
+                            'old_price': old_price,
+                            'new_price': new_price,
+                            'change_pct': change_pct
+                        })
+                        logger.info(f"  💰 Price changed: {existing_journey.company_name} @ {existing_journey.departure_time.strftime('%H:%M') if existing_journey.departure_time else 'N/A'} | {old_price} → {new_price} TRY ({change_pct:+.1f}%)")
+            
+            # 4. Eklenecekler
+            to_insert_keys = new_keys - existing_keys
+            inserted_journeys = []
+            
+            for key in to_insert_keys:
+                new_data = new_dict[key]
+                journey_obj = self.create_journey_object(new_data)
+                session.add(journey_obj)
+                inserted_journeys.append(journey_obj)
+                
+                logger.info(f"  ➕ New journey: {journey_obj.company_name} @ {journey_obj.departure_time.strftime('%H:%M') if journey_obj.departure_time else 'N/A'} | {journey_obj.internet_price} TRY")
             
             session.commit()
-            logger.error(f"🚨 BAN ALERT SENT - Block rate: {self.ban_monitor.get_block_rate():.1f}%")
+            
+            # 5. Alert oluştur
+            self.create_alerts_for_changes(
+                session=session,
+                route_id=route_id,
+                price_changes=price_changes,
+                new_journeys=inserted_journeys,
+                target_date=target_date
+            )
+            
+            logger.info(f"  📊 Route {route_id} sync: {len(to_insert_keys)} inserted, {updated_count} updated, {deleted_count} deleted")
+            
+            return {
+                'inserted': len(to_insert_keys),
+                'updated': updated_count,
+                'deleted': deleted_count,
+                'price_changes': len(price_changes)
+            }
             
         except Exception as e:
-            logger.error(f"❌ Failed to send ban alert: {e}")
+            session.rollback()
+            logger.error(f"❌ Sync error for route {route_id}: {e}")
+            raise
         finally:
             session.close()
-    
-    def run(self, target_date=None, cleanup_old_data=False):
-        """
-        Ana scraping fonksiyonu (BAN TESPİTİ İLE)
-        """
-        logger.info("=" * 80)
-        logger.info("🚀 Obilet Scraper Starting...")
-        logger.info(f"📅 Timestamp: {datetime.utcnow().isoformat()}")
-        logger.info("=" * 80)
         
-        start_time = time.time()
+        def create_alerts_for_changes(self, session, route_id, price_changes, new_journeys, target_date):
+            """
+            Fiyat değişiklikleri ve yeni seferler için alert oluştur
+            """
+            try:
+                # Bu route'u takip eden firmaları bul
+                company_routes = session.query(CompanyRoute).filter(
+                    CompanyRoute.route_id == route_id,
+                    CompanyRoute.is_active == True
+                ).all()
+                
+                if not company_routes:
+                    return
+                
+                # Her firma için alert oluştur
+                for cr in company_routes:
+                    user = cr.user
+                    
+                    # Fiyat değişikliği alertleri
+                    if cr.alert_on_price_change:
+                        for change in price_changes:
+                            # Threshold kontrolü
+                            if abs(change['change_pct']) >= float(cr.alert_threshold_percentage or 0):
+                                
+                                alert_type = 'price_drop' if change['change_pct'] < 0 else 'price_increase'
+                                
+                                alert = PriceAlert(
+                                    user_id=user.id,
+                                    route_id=route_id,
+                                    alert_type=alert_type,
+                                    title=f"{'Fiyat Düştü' if alert_type == 'price_drop' else 'Fiyat Arttı'}: {change['journey'].company_name}",
+                                    message=f"{change['journey'].company_name} firmasının {change['journey'].departure_time.strftime('%H:%M') if change['journey'].departure_time else 'N/A'} seferinde fiyat {change['old_price']} TRY'den {change['new_price']} TRY'ye değişti ({change['change_pct']:+.1f}%)",
+                                    competitor_name=change['journey'].company_name,
+                                    old_price=change['old_price'],
+                                    new_price=change['new_price'],
+                                    price_change_percentage=change['change_pct'],
+                                    departure_date=target_date,
+                                    priority='high' if abs(change['change_pct']) > 20 else 'medium',
+                                    is_read=False,
+                                    is_sent=False
+                                )
+                                session.add(alert)
+                                logger.info(f"    🔔 Alert created for user {user.company_name}: Price change")
+                    
+                    # Yeni sefer alertleri
+                    for new_journey in new_journeys:
+                        # En düşük fiyatlı mı kontrol et
+                        min_price_journey = session.query(Journey).filter(
+                            Journey.route_id == route_id,
+                            Journey.departure_time >= target_date,
+                            Journey.departure_time < target_date + timedelta(days=1),
+                            Journey.is_active == True
+                        ).order_by(Journey.internet_price.asc()).first()
+                        
+                        is_lowest_price = (min_price_journey and 
+                                          new_journey.internet_price == min_price_journey.internet_price)
+                        
+                        alert = PriceAlert(
+                            user_id=user.id,
+                            route_id=route_id,
+                            alert_type='new_journey',
+                            title=f"Yeni Sefer Eklendi: {new_journey.company_name}",
+                            message=f"{new_journey.company_name} firması {new_journey.departure_time.strftime('%H:%M') if new_journey.departure_time else 'N/A'} seferini ekledi. Fiyat: {new_journey.internet_price} TRY" + (" - EN DÜŞÜK FİYAT! 🎉" if is_lowest_price else ""),
+                            competitor_name=new_journey.company_name,
+                            new_price=new_journey.internet_price,
+                            departure_date=target_date,
+                            priority='high' if is_lowest_price else 'low',
+                            is_read=False,
+                            is_sent=False
+                        )
+                        session.add(alert)
+                        logger.info(f"    🔔 Alert created for user {user.company_name}: New journey")
+                
+                session.commit()
+                
+            except Exception as e:
+                logger.error(f"❌ Alert creation error: {e}")
         
-        # ... mevcut scraping kodu ...
+        def insert_price_history_for_route(self, route_journeys, target_date):
+            """
+            Bir route için Price History ekle
+            """
+            session = get_session()
+            
+            try:
+                price_records = []
+                
+                for data in route_journeys:
+                    departure_dt = None
+                    if data.get('departure'):
+                        try:
+                            departure_dt = datetime.fromisoformat(data['departure'].replace('Z', '+00:00'))
+                        except:
+                            pass
+                    
+                    occupancy_rate = None
+                    if data.get('total_seats') and data['total_seats'] > 0:
+                        occupied = data['total_seats'] - data.get('available_seats', 0)
+                        occupancy_rate = round((occupied / data['total_seats']) * 100, 2)
+                    
+                    days_before = (target_date - date.today()).days if target_date else 0
+                    
+                    price_hist = PriceHistory(
+                        route_id=data['route_id'],
+                        company_name=data.get('partner_name', 'Unknown'),
+                        obilet_partner_id=data.get('partner_id'),
+                        price=data.get('internet_price'),
+                        currency=data.get('currency', 'TRY'),
+                        departure_date=target_date,
+                        days_before_departure=days_before,
+                        available_seats=data.get('available_seats', 0),
+                        total_seats=data.get('total_seats'),
+                        occupancy_rate=occupancy_rate
+                    )
+                    
+                    price_records.append(price_hist)
+                
+                if price_records:
+                    session.bulk_save_objects(price_records)
+                    session.commit()
+                    logger.info(f"    💾 Price History: {len(price_records)} records added")
+                
+            except Exception as e:
+                session.rollback()
+                logger.error(f"❌ Price History error: {e}")
+            finally:
+                session.close()
         
-        # Scraping tamamlandı - ban kontrolü
-        if self.ban_monitor.should_alert():
-            logger.error("🚨 HIGH BLOCK RATE DETECTED!")
-            self.send_ban_alert()
+        def cleanup_old_data(self, days_to_keep=30):
+            """
+            Eski verileri temizle
+            - Journey: is_active=False ve eski olanları sil
+            - PriceHistory: X günden eski olanları sil
+            """
+            session = get_session()
+            cutoff_date = datetime.utcnow() - timedelta(days=days_to_keep)
+            
+            try:
+                # Journey'leri temizle (soft deleted + eski)
+                deleted_journeys = session.query(Journey).filter(
+                    Journey.is_active == False,
+                    Journey.scraped_at < cutoff_date
+                ).delete()
+                
+                # Price History temizle
+                deleted_price_history = session.query(PriceHistory).filter(
+                    PriceHistory.recorded_at < cutoff_date
+                ).delete()
+                
+                session.commit()
+                
+                logger.info(f"🧹 Cleanup: {deleted_journeys} old journeys, {deleted_price_history} old price records deleted")
+                
+            except Exception as e:
+                session.rollback()
+                logger.error(f"❌ Cleanup error: {e}")
+            finally:
+                session.close()
         
-        # Final statistics
-        elapsed = time.time() - start_time
-        
-        logger.info("=" * 80)
-        logger.info("✅ Scraper Completed!")
-        logger.info(f"   Duration: {elapsed:.1f}s")
-        logger.info(f"   Routes Processed: {self.completed_routes}/{self.total_routes}")
-        logger.info(f"   Routes Failed: {self.failed_routes}")
-        logger.info(f"   Total Journeys Scraped: {self.total_journeys}")
-        logger.info("")
-        logger.info("   📊 Database Changes:")
-        logger.info(f"      Inserted: {total_inserted}")
-        logger.info(f"      Updated: {total_updated}")
-        logger.info(f"      Deleted: {total_deleted}")
-        logger.info(f"      Price Changes: {total_price_changes}")
-        logger.info("")
-        logger.info("   🛡️  ScrapingBee Status:")
-        logger.info(f"      Total Requests: {self.ban_monitor.total_requests}")
-        logger.info(f"      Failed: {self.ban_monitor.failed_requests}")
-        logger.info(f"      Blocked: {self.ban_monitor.blocked_requests}")
-        logger.info(f"      Block Rate: {self.ban_monitor.get_block_rate():.1f}%")
-        logger.info("=" * 80)
-        
-        return self.scraped_data
+        def run(self, target_date=None, cleanup_old_data=False):
+            """
+            Ana scraping + sync fonksiyonu
+            """
+            logger.info("=" * 80)
+            logger.info("🚀 Obilet Scraper Starting...")
+            logger.info("=" * 80)
+            
+            start_time = time.time()
+            
+            # Target date (default: bugün)
+            if not target_date:
+                target_date = date.today()
+            
+            date_str = target_date.strftime('%Y-%m-%d')
+            logger.info(f"📅 Target Date: {date_str}")
+            
+            # Eski verileri temizle (opsiyonel)
+            if cleanup_old_data:
+                logger.info("\n🧹 Cleaning up old data...")
+                self.cleanup_old_data(days_to_keep=30)
+                logger.info("")
+            
+            # Database'den route'ları çek
+            routes = self.get_active_routes()
+            
+            if not routes:
+                logger.error("❌ No active routes found in database!")
+                return
+            
+            self.total_routes = len(routes)
+            logger.info(f"📊 Total Routes: {self.total_routes}")
+            logger.info(f"⚙️  Max Workers: {self.max_workers}")
+            logger.info("-" * 80)
+            
+            # Statistics
+            total_inserted = 0
+            total_updated = 0
+            total_deleted = 0
+            total_price_changes = 0
+            
+            # Her route için scrape et
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Future'ları dictionary'de tut
+                future_to_route = {
+                    executor.submit(self.scrape_route_with_retry, route, date_str): route
+                    for route in routes
+                }
+                
+                for future in as_completed(future_to_route):
+                    route = future_to_route[future]
+                    
+                    try:
+                        # Scraping sonucu
+                        result = future.result()
+                        
+                        if result['success'] and result.get('count', 0) > 0:
+                            # Bu route için scraped journeys'i al
+                            route_journeys = [
+                                j for j in self.scraped_data 
+                                if j['route_id'] == route.id
+                            ]
+                            
+                            # Sync yap
+                            logger.info(f"\n🔄 Syncing route {route.id}: {route.route_name or 'N/A'}")
+                            sync_result = self.sync_journeys_for_route(
+                                route_id=route.id,
+                                new_journeys_data=route_journeys,
+                                target_date=target_date
+                            )
+                            
+                            total_inserted += sync_result['inserted']
+                            total_updated += sync_result['updated']
+                            total_deleted += sync_result['deleted']
+                            total_price_changes += sync_result['price_changes']
+                            
+                            # Price History ekle
+                            self.insert_price_history_for_route(route_journeys, target_date)
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Error processing route {route.id}: {e}")
+            
+            if self.ban_monitor.should_alert():
+                logger.error("🚨 HIGH BLOCK RATE DETECTED!")
+                self.send_ban_alert()
+
+
+            # Final statistics
+            elapsed = time.time() - start_time
+            
+            logger.info("=" * 80)
+            logger.info("✅ Scraper Completed!")
+            logger.info(f"   Duration: {elapsed:.1f}s")
+            logger.info(f"   Routes Processed: {self.completed_routes}/{self.total_routes}")
+            logger.info(f"   Routes Failed: {self.failed_routes}")
+            logger.info(f"   Total Journeys Scraped: {self.total_journeys}")
+            logger.info("")
+            logger.info("   📊 Database Changes:")
+            logger.info(f"      Inserted: {total_inserted}")
+            logger.info(f"      Updated: {total_updated}")
+            logger.info(f"      Deleted: {total_deleted}")
+            logger.info(f"      Price Changes: {total_price_changes}")
+            logger.info("=" * 80)
+            
+            return self.scraped_data
 
 
 if __name__ == '__main__':
     # Database URL check
-    DATABASE_URL = os.getenv('DATABASE_URL')
-    
-    if not DATABASE_URL:
+    if not os.getenv('DATABASE_URL'):
         logger.error("❌ DATABASE_URL environment variable not set!")
-        sys.exit(1)
+        logger.info("Usage: export DATABASE_URL='postgresql://user:pass@host:5432/dbname'")
+        exit(1)
     
-    logger.info(f"✅ DATABASE_URL configured")
-    logger.info(f"✅ SCRAPINGBEE_API_KEY configured: {'Yes' if os.getenv('SCRAPINGBEE_API_KEY') else 'No'}")
+    # Scraper çalıştır
+    scraper = ObiletScraper(
+        max_workers=10,
+        max_retries=3,
+        batch_size=500
+    )
     
-    try:
-        # Scraper çalıştır
-        scraper = ObiletScraper(
-            max_workers=10,
-            max_retries=3,
-            batch_size=500
-        )
-        
-        # Bugün için scrape et
-        scraped_data = scraper.run(cleanup_old_data=True)
-        
-        logger.info("\n🎉 All operations completed successfully!")
-        sys.exit(0)  # Success
-        
-    except Exception as e:
-        logger.error(f"💥 FATAL ERROR: {e}", exc_info=True)
-        sys.exit(1)  # Failure
+    # Bugün için scrape et
+    # cleanup_old_data=True → 30 günden eski verileri sil
+    scraped_data = scraper.run(cleanup_old_data=True)
+    
+    logger.info("\n🎉 All operations completed successfully!")
