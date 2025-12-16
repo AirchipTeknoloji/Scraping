@@ -26,7 +26,7 @@ from models_standalone import (
 #logger = logging.getLogger(__name__)
 
 # ScrapingBee API Key
-API_KEY = os.getenv('SCRAPINGBEE_API_KEY', '85KGJQAG8QSNBIQ4UNK8J3M6H57NBN8L9H6V7KFK8HXJKB2X1G6JK9JFKUX121W1ZRN9CVO9OZEXIWLE')
+API_KEY = os.getenv('SCRAPINGBEE_API_KEY', 'A5XVM0SXQ8I6BVBERL7AK6VXCTGKBUC4R5SO5QG0WNQPM4QINQVZWBI7H9UWDOYIYPF4OBHC9QO3Q8T3')
 
 
 
@@ -188,7 +188,7 @@ class ObiletScraper:
                     'destination': journey.get('destination'),
                     'departure': journey.get('departure'),
                     'arrival': journey.get('arrival'),
-                    'duration': journey.get('duration'),
+                    'duration': 0,
                     
                     # Fiyat
                     'original_price': journey.get('original-price'),
@@ -200,7 +200,7 @@ class ObiletScraper:
                     'peron_no': journey.get('peron-no'),
                     
                     # Özellikler
-                    'features': [f.get('name') for f in j.get('features', [])],
+                    'features': [],
                     
                     # Duraklar
                     'stops': [
@@ -352,6 +352,7 @@ Action may be required!
         Tek bir route için scraping yap (GÜNCELLENMİŞ)
         """
         route_name = route.route_name or f"{route.origin_city_name} → {route.destination_city_name}"
+        logger.warning(f"⚠️  {route_name}: TEKRAR DENENİYOR!!!!!!!")
         
         for attempt in range(self.max_retries):
             try:
@@ -399,6 +400,18 @@ Action may be required!
                 wait_time = 2 ** attempt
                 logger.warning(f"⟳ {route_name} attempt {attempt + 1}/{self.max_retries} failed, retrying in {wait_time}s...")
                 time.sleep(wait_time)
+
+    def get_unique_key(self, journey_data):
+        """
+        Journey'yi benzersiz şekilde tanımlayan key
+        (route_id, departure_time, partner_id)
+        """
+        return (
+            journey_data['route_id'],
+            journey_data.get('departure'),
+            journey_data.get('partner_id')
+        )
+    
 
     def create_journey_object(self, data):
         """
@@ -567,282 +580,282 @@ Action may be required!
         finally:
             session.close()
         
-        def create_alerts_for_changes(self, session, route_id, price_changes, new_journeys, target_date):
-            """
-            Fiyat değişiklikleri ve yeni seferler için alert oluştur
-            """
-            try:
-                # Bu route'u takip eden firmaları bul
-                company_routes = session.query(CompanyRoute).filter(
-                    CompanyRoute.route_id == route_id,
-                    CompanyRoute.is_active == True
-                ).all()
-                
-                if not company_routes:
-                    return
-                
-                # Her firma için alert oluştur
-                for cr in company_routes:
-                    user = cr.user
-                    
-                    # Fiyat değişikliği alertleri
-                    if cr.alert_on_price_change:
-                        for change in price_changes:
-                            # Threshold kontrolü
-                            if abs(change['change_pct']) >= float(cr.alert_threshold_percentage or 0):
-                                
-                                alert_type = 'price_drop' if change['change_pct'] < 0 else 'price_increase'
-                                
-                                alert = PriceAlert(
-                                    user_id=user.id,
-                                    route_id=route_id,
-                                    alert_type=alert_type,
-                                    title=f"{'Fiyat Düştü' if alert_type == 'price_drop' else 'Fiyat Arttı'}: {change['journey'].company_name}",
-                                    message=f"{change['journey'].company_name} firmasının {change['journey'].departure_time.strftime('%H:%M') if change['journey'].departure_time else 'N/A'} seferinde fiyat {change['old_price']} TRY'den {change['new_price']} TRY'ye değişti ({change['change_pct']:+.1f}%)",
-                                    competitor_name=change['journey'].company_name,
-                                    old_price=change['old_price'],
-                                    new_price=change['new_price'],
-                                    price_change_percentage=change['change_pct'],
-                                    departure_date=target_date,
-                                    priority='high' if abs(change['change_pct']) > 20 else 'medium',
-                                    is_read=False,
-                                    is_sent=False
-                                )
-                                session.add(alert)
-                                logger.info(f"    🔔 Alert created for user {user.company_name}: Price change")
-                    
-                    # Yeni sefer alertleri
-                    for new_journey in new_journeys:
-                        # En düşük fiyatlı mı kontrol et
-                        min_price_journey = session.query(Journey).filter(
-                            Journey.route_id == route_id,
-                            Journey.departure_time >= target_date,
-                            Journey.departure_time < target_date + timedelta(days=1),
-                            Journey.is_active == True
-                        ).order_by(Journey.internet_price.asc()).first()
-                        
-                        is_lowest_price = (min_price_journey and 
-                                          new_journey.internet_price == min_price_journey.internet_price)
-                        
-                        alert = PriceAlert(
-                            user_id=user.id,
-                            route_id=route_id,
-                            alert_type='new_journey',
-                            title=f"Yeni Sefer Eklendi: {new_journey.company_name}",
-                            message=f"{new_journey.company_name} firması {new_journey.departure_time.strftime('%H:%M') if new_journey.departure_time else 'N/A'} seferini ekledi. Fiyat: {new_journey.internet_price} TRY" + (" - EN DÜŞÜK FİYAT! 🎉" if is_lowest_price else ""),
-                            competitor_name=new_journey.company_name,
-                            new_price=new_journey.internet_price,
-                            departure_date=target_date,
-                            priority='high' if is_lowest_price else 'low',
-                            is_read=False,
-                            is_sent=False
-                        )
-                        session.add(alert)
-                        logger.info(f"    🔔 Alert created for user {user.company_name}: New journey")
-                
-                session.commit()
-                
-            except Exception as e:
-                logger.error(f"❌ Alert creation error: {e}")
-        
-        def insert_price_history_for_route(self, route_journeys, target_date):
-            """
-            Bir route için Price History ekle
-            """
-            session = get_session()
+    def create_alerts_for_changes(self, session, route_id, price_changes, new_journeys, target_date):
+        """
+        Fiyat değişiklikleri ve yeni seferler için alert oluştur
+        """
+        try:
+            # Bu route'u takip eden firmaları bul
+            company_routes = session.query(CompanyRoute).filter(
+                CompanyRoute.route_id == route_id,
+                CompanyRoute.is_active == True
+            ).all()
             
-            try:
-                price_records = []
-                
-                for data in route_journeys:
-                    departure_dt = None
-                    if data.get('departure'):
-                        try:
-                            departure_dt = datetime.fromisoformat(data['departure'].replace('Z', '+00:00'))
-                        except:
-                            pass
-                    
-                    occupancy_rate = None
-                    if data.get('total_seats') and data['total_seats'] > 0:
-                        occupied = data['total_seats'] - data.get('available_seats', 0)
-                        occupancy_rate = round((occupied / data['total_seats']) * 100, 2)
-                    
-                    days_before = (target_date - date.today()).days if target_date else 0
-                    
-                    price_hist = PriceHistory(
-                        route_id=data['route_id'],
-                        company_name=data.get('partner_name', 'Unknown'),
-                        obilet_partner_id=data.get('partner_id'),
-                        price=data.get('internet_price'),
-                        currency=data.get('currency', 'TRY'),
-                        departure_date=target_date,
-                        days_before_departure=days_before,
-                        available_seats=data.get('available_seats', 0),
-                        total_seats=data.get('total_seats'),
-                        occupancy_rate=occupancy_rate
-                    )
-                    
-                    price_records.append(price_hist)
-                
-                if price_records:
-                    session.bulk_save_objects(price_records)
-                    session.commit()
-                    logger.info(f"    💾 Price History: {len(price_records)} records added")
-                
-            except Exception as e:
-                session.rollback()
-                logger.error(f"❌ Price History error: {e}")
-            finally:
-                session.close()
-        
-        def cleanup_old_data(self, days_to_keep=30):
-            """
-            Eski verileri temizle
-            - Journey: is_active=False ve eski olanları sil
-            - PriceHistory: X günden eski olanları sil
-            """
-            session = get_session()
-            cutoff_date = datetime.utcnow() - timedelta(days=days_to_keep)
-            
-            try:
-                # Journey'leri temizle (soft deleted + eski)
-                deleted_journeys = session.query(Journey).filter(
-                    Journey.is_active == False,
-                    Journey.scraped_at < cutoff_date
-                ).delete()
-                
-                # Price History temizle
-                deleted_price_history = session.query(PriceHistory).filter(
-                    PriceHistory.recorded_at < cutoff_date
-                ).delete()
-                
-                session.commit()
-                
-                logger.info(f"🧹 Cleanup: {deleted_journeys} old journeys, {deleted_price_history} old price records deleted")
-                
-            except Exception as e:
-                session.rollback()
-                logger.error(f"❌ Cleanup error: {e}")
-            finally:
-                session.close()
-        
-        def run(self, target_date=None, cleanup_old_data=False):
-            """
-            Ana scraping + sync fonksiyonu
-            """
-            logger.info("=" * 80)
-            logger.info("🚀 Obilet Scraper Starting...")
-            logger.info("=" * 80)
-            
-            start_time = time.time()
-            
-            # Target date (default: bugün)
-            if not target_date:
-                target_date = date.today()
-            
-            date_str = target_date.strftime('%Y-%m-%d')
-            logger.info(f"📅 Target Date: {date_str}")
-            
-            # Eski verileri temizle (opsiyonel)
-            if cleanup_old_data:
-                logger.info("\n🧹 Cleaning up old data...")
-                self.cleanup_old_data(days_to_keep=30)
-                logger.info("")
-            
-            # Database'den route'ları çek
-            routes = self.get_active_routes()
-            
-            if not routes:
-                logger.error("❌ No active routes found in database!")
+            if not company_routes:
                 return
             
-            self.total_routes = len(routes)
-            logger.info(f"📊 Total Routes: {self.total_routes}")
-            logger.info(f"⚙️  Max Workers: {self.max_workers}")
-            logger.info("-" * 80)
-            
-            # Statistics
-            total_inserted = 0
-            total_updated = 0
-            total_deleted = 0
-            total_price_changes = 0
-            
-            # Her route için scrape et
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # Future'ları dictionary'de tut
-                future_to_route = {
-                    executor.submit(self.scrape_route_with_retry, route, date_str): route
-                    for route in routes
-                }
+            # Her firma için alert oluştur
+            for cr in company_routes:
+                user = cr.user
                 
-                for future in as_completed(future_to_route):
-                    route = future_to_route[future]
-                    
-                    try:
-                        # Scraping sonucu
-                        result = future.result()
-                        
-                        if result['success'] and result.get('count', 0) > 0:
-                            # Bu route için scraped journeys'i al
-                            route_journeys = [
-                                j for j in self.scraped_data 
-                                if j['route_id'] == route.id
-                            ]
+                # Fiyat değişikliği alertleri
+                if cr.alert_on_price_change:
+                    for change in price_changes:
+                        # Threshold kontrolü
+                        if abs(change['change_pct']) >= float(cr.alert_threshold_percentage or 0):
                             
-                            # Sync yap
-                            logger.info(f"\n🔄 Syncing route {route.id}: {route.route_name or 'N/A'}")
-                            sync_result = self.sync_journeys_for_route(
-                                route_id=route.id,
-                                new_journeys_data=route_journeys,
-                                target_date=target_date
+                            alert_type = 'price_drop' if change['change_pct'] < 0 else 'price_increase'
+                            
+                            alert = PriceAlert(
+                                user_id=user.id,
+                                route_id=route_id,
+                                alert_type=alert_type,
+                                title=f"{'Fiyat Düştü' if alert_type == 'price_drop' else 'Fiyat Arttı'}: {change['journey'].company_name}",
+                                message=f"{change['journey'].company_name} firmasının {change['journey'].departure_time.strftime('%H:%M') if change['journey'].departure_time else 'N/A'} seferinde fiyat {change['old_price']} TRY'den {change['new_price']} TRY'ye değişti ({change['change_pct']:+.1f}%)",
+                                competitor_name=change['journey'].company_name,
+                                old_price=change['old_price'],
+                                new_price=change['new_price'],
+                                price_change_percentage=change['change_pct'],
+                                departure_date=target_date,
+                                priority='high' if abs(change['change_pct']) > 20 else 'medium',
+                                is_read=False,
+                                is_sent=False
                             )
-                            
-                            total_inserted += sync_result['inserted']
-                            total_updated += sync_result['updated']
-                            total_deleted += sync_result['deleted']
-                            total_price_changes += sync_result['price_changes']
-                            
-                            # Price History ekle
-                            self.insert_price_history_for_route(route_journeys, target_date)
-                        
-                    except Exception as e:
-                        logger.error(f"❌ Error processing route {route.id}: {e}")
+                            session.add(alert)
+                            logger.info(f"    🔔 Alert created for user {user.company_name}: Price change")
+                
+                # Yeni sefer alertleri
+                for new_journey in new_journeys:
+                    # En düşük fiyatlı mı kontrol et
+                    min_price_journey = session.query(Journey).filter(
+                        Journey.route_id == route_id,
+                        Journey.departure_time >= target_date,
+                        Journey.departure_time < target_date + timedelta(days=1),
+                        Journey.is_active == True
+                    ).order_by(Journey.internet_price.asc()).first()
+                    
+                    is_lowest_price = (min_price_journey and 
+                                      new_journey.internet_price == min_price_journey.internet_price)
+                    
+                    alert = PriceAlert(
+                        user_id=user.id,
+                        route_id=route_id,
+                        alert_type='new_journey',
+                        title=f"Yeni Sefer Eklendi: {new_journey.company_name}",
+                        message=f"{new_journey.company_name} firması {new_journey.departure_time.strftime('%H:%M') if new_journey.departure_time else 'N/A'} seferini ekledi. Fiyat: {new_journey.internet_price} TRY" + (" - EN DÜŞÜK FİYAT! 🎉" if is_lowest_price else ""),
+                        competitor_name=new_journey.company_name,
+                        new_price=new_journey.internet_price,
+                        departure_date=target_date,
+                        priority='high' if is_lowest_price else 'low',
+                        is_read=False,
+                        is_sent=False
+                    )
+                    session.add(alert)
+                    logger.info(f"    🔔 Alert created for user {user.company_name}: New journey")
             
-            if self.ban_monitor.should_alert():
-                logger.error("🚨 HIGH BLOCK RATE DETECTED!")
-                self.send_ban_alert()
-
-
-            # Final statistics
-            elapsed = time.time() - start_time
+            session.commit()
             
-            logger.info("=" * 80)
-            logger.info("✅ Scraper Completed!")
-            logger.info(f"   Duration: {elapsed:.1f}s")
-            logger.info(f"   Routes Processed: {self.completed_routes}/{self.total_routes}")
-            logger.info(f"   Routes Failed: {self.failed_routes}")
-            logger.info(f"   Total Journeys Scraped: {self.total_journeys}")
+        except Exception as e:
+            logger.error(f"❌ Alert creation error: {e}")
+    
+    def insert_price_history_for_route(self, route_journeys, target_date):
+        """
+        Bir route için Price History ekle
+        """
+        session = get_session()
+        
+        try:
+            price_records = []
+            
+            for data in route_journeys:
+                departure_dt = None
+                if data.get('departure'):
+                    try:
+                        departure_dt = datetime.fromisoformat(data['departure'].replace('Z', '+00:00'))
+                    except:
+                        pass
+                
+                occupancy_rate = None
+                if data.get('total_seats') and data['total_seats'] > 0:
+                    occupied = data['total_seats'] - data.get('available_seats', 0)
+                    occupancy_rate = round((occupied / data['total_seats']) * 100, 2)
+                
+                days_before = (target_date - date.today()).days if target_date else 0
+                
+                price_hist = PriceHistory(
+                    route_id=data['route_id'],
+                    company_name=data.get('partner_name', 'Unknown'),
+                    obilet_partner_id=data.get('partner_id'),
+                    price=data.get('internet_price'),
+                    currency=data.get('currency', 'TRY'),
+                    departure_date=target_date,
+                    days_before_departure=days_before,
+                    available_seats=data.get('available_seats', 0),
+                    total_seats=data.get('total_seats'),
+                    occupancy_rate=occupancy_rate
+                )
+                
+                price_records.append(price_hist)
+            
+            if price_records:
+                session.bulk_save_objects(price_records)
+                session.commit()
+                logger.info(f"    💾 Price History: {len(price_records)} records added")
+            
+        except Exception as e:
+            session.rollback()
+            logger.error(f"❌ Price History error: {e}")
+        finally:
+            session.close()
+    
+    def cleanup_old_data(self, days_to_keep=30):
+        """
+        Eski verileri temizle
+        - Journey: is_active=False ve eski olanları sil
+        - PriceHistory: X günden eski olanları sil
+        """
+        session = get_session()
+        cutoff_date = datetime.utcnow() - timedelta(days=days_to_keep)
+        
+        try:
+            # Journey'leri temizle (soft deleted + eski)
+            deleted_journeys = session.query(Journey).filter(
+                Journey.is_active == False,
+                Journey.scraped_at < cutoff_date
+            ).delete()
+            
+            # Price History temizle
+            deleted_price_history = session.query(PriceHistory).filter(
+                PriceHistory.recorded_at < cutoff_date
+            ).delete()
+            
+            session.commit()
+            
+            logger.info(f"🧹 Cleanup: {deleted_journeys} old journeys, {deleted_price_history} old price records deleted")
+            
+        except Exception as e:
+            session.rollback()
+            logger.error(f"❌ Cleanup error: {e}")
+        finally:
+            session.close()
+    
+    def run(self, target_date=None, cleanup_old_data=False):
+        """
+        Ana scraping + sync fonksiyonu
+        """
+        logger.info("=" * 80)
+        logger.info("🚀 Obilet Scraper Starting...")
+        logger.info("=" * 80)
+        
+        start_time = time.time()
+        
+        # Target date (default: bugün)
+        if not target_date:
+            target_date = date.today()
+        
+        date_str = target_date.strftime('%Y-%m-%d')
+        logger.info(f"📅 Target Date: {date_str}")
+        
+        # Eski verileri temizle (opsiyonel)
+        if cleanup_old_data:
+            logger.info("\n🧹 Cleaning up old data...")
+            self.cleanup_old_data(days_to_keep=30)
             logger.info("")
-            logger.info("   📊 Database Changes:")
-            logger.info(f"      Inserted: {total_inserted}")
-            logger.info(f"      Updated: {total_updated}")
-            logger.info(f"      Deleted: {total_deleted}")
-            logger.info(f"      Price Changes: {total_price_changes}")
-            logger.info("=" * 80)
+        
+        # Database'den route'ları çek
+        routes = self.get_active_routes()
+        
+        if not routes:
+            logger.error("❌ No active routes found in database!")
+            return
+        
+        self.total_routes = len(routes)
+        logger.info(f"📊 Total Routes: {self.total_routes}")
+        logger.info(f"⚙️  Max Workers: {self.max_workers}")
+        logger.info("-" * 80)
+        
+        # Statistics
+        total_inserted = 0
+        total_updated = 0
+        total_deleted = 0
+        total_price_changes = 0
+        
+        # Her route için scrape et
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Future'ları dictionary'de tut
+            future_to_route = {
+                executor.submit(self.scrape_route_with_retry, route, date_str): route
+                for route in routes
+            }
             
-            return self.scraped_data
+            for future in as_completed(future_to_route):
+                route = future_to_route[future]
+                
+                try:
+                    # Scraping sonucu
+                    result = future.result()
+                    
+                    if result['success'] and result.get('count', 0) > 0:
+                        # Bu route için scraped journeys'i al
+                        route_journeys = [
+                            j for j in self.scraped_data 
+                            if j['route_id'] == route.id
+                        ]
+                        
+                        # Sync yap
+                        logger.info(f"\n🔄 Syncing route {route.id}: {route.route_name or 'N/A'}")
+                        sync_result = self.sync_journeys_for_route(
+                            route_id=route.id,
+                            new_journeys_data=route_journeys,
+                            target_date=target_date
+                        )
+                        
+                        total_inserted += sync_result['inserted']
+                        total_updated += sync_result['updated']
+                        total_deleted += sync_result['deleted']
+                        total_price_changes += sync_result['price_changes']
+                        
+                        # Price History ekle
+                        self.insert_price_history_for_route(route_journeys, target_date)
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error processing route {route.id}: {e}")
+        
+        if self.ban_monitor.should_alert():
+            logger.error("🚨 HIGH BLOCK RATE DETECTED!")
+            self.send_ban_alert()
+
+
+        # Final statistics
+        elapsed = time.time() - start_time
+        
+        logger.info("=" * 80)
+        logger.info("✅ Scraper Completed!")
+        logger.info(f"   Duration: {elapsed:.1f}s")
+        logger.info(f"   Routes Processed: {self.completed_routes}/{self.total_routes}")
+        logger.info(f"   Routes Failed: {self.failed_routes}")
+        logger.info(f"   Total Journeys Scraped: {self.total_journeys}")
+        logger.info("")
+        logger.info("   📊 Database Changes:")
+        logger.info(f"      Inserted: {total_inserted}")
+        logger.info(f"      Updated: {total_updated}")
+        logger.info(f"      Deleted: {total_deleted}")
+        logger.info(f"      Price Changes: {total_price_changes}")
+        logger.info("=" * 80)
+        
+        return self.scraped_data
 
 
 if __name__ == '__main__':
     # Database URL check
-    if not os.getenv('DATABASE_URL'):
+    if not os.getenv('DATABASE_URL', 'postgresql://doadmin:AVNS_zd8YbZpiFc5dU9HRIc3@db-postgresql-fra1-91466-do-user-30609413-0.i.db.ondigitalocean.com:25060/defaultdb?sslmode=require'):
         logger.error("❌ DATABASE_URL environment variable not set!")
         logger.info("Usage: export DATABASE_URL='postgresql://user:pass@host:5432/dbname'")
         exit(1)
     
     # Scraper çalıştır
     scraper = ObiletScraper(
-        max_workers=10,
+        max_workers=5,
         max_retries=3,
         batch_size=500
     )
