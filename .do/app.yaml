@@ -1,0 +1,39 @@
+name: obilet-scraper-worker
+region: fra  # Frankfurt (Türkiye'ye yakın)
+
+# Environment variables
+envs:
+  - key: DATABASE_URL
+    scope: RUN_TIME
+    type: SECRET
+    # DigitalOcean dashboard'dan ekleyeceksin
+  
+  - key: SCRAPINGBEE_API_KEY
+    scope: RUN_TIME
+    type: SECRET
+    # DigitalOcean dashboard'dan ekleyeceksin
+
+# Cron job definition
+jobs:
+  - name: scraper-hourly
+    kind: CRON
+    schedule: "0 * * * *"  # Her saat başı (00:00, 01:00, 02:00...)
+    
+    # Source code
+    github:
+      repo: AirchipTeknoloji/Scraping
+      branch: main
+      deploy_on_push: true
+    
+    source_dir: /scraper_worker
+    
+    # Çalıştırılacak komut
+    run_command: python main.py
+    
+    # Instance configuration
+    instance_size_slug: basic-xxs  # En küçük - $5/ay
+    instance_count: 1
+    
+    # Log configuration
+    log_destinations:
+      - name: scraper-logs
