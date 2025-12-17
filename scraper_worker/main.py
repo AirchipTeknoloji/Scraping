@@ -776,6 +776,7 @@ Action may be required!
         # Target date (default: bugün)
         if not target_date:
             target_date = date.today()
+            print(target_date)
         
         date_str = target_date.strftime('%Y-%m-%d')
         logger.info(f"📅 Target Date: {date_str}")
