@@ -26,7 +26,7 @@ from models_standalone import (
 #logger = logging.getLogger(__name__)
 
 # ScrapingBee API Key
-API_KEY = os.getenv('SCRAPINGBEE_API_KEY', 'A5XVM0SXQ8I6BVBERL7AK6VXCTGKBUC4R5SO5QG0WNQPM4QINQVZWBI7H9UWDOYIYPF4OBHC9QO3Q8T3')
+API_KEY = os.getenv('SCRAPINGBEE_API_KEY', '1BK95SF6JYACP830LL46SNQWJZZYZVMF6QS04DHBLE6QAIZNPVGO30O5CRN9HUMMNX6LC6FML1KJSDOE')
 
 
 
@@ -106,7 +106,7 @@ class ScrapingBeeMonitor:
 
 
 class ObiletScraper:
-    def __init__(self, max_workers=10, max_retries=3, batch_size=500):
+    def __init__(self, max_workers=4, max_retries=10, batch_size=500):
         self.max_workers = max_workers
         self.max_retries = max_retries
         self.batch_size = batch_size
@@ -140,6 +140,7 @@ class ObiletScraper:
         Obilet JSON endpoint'inden seferleri çeker (ScrapingBee ile)
         """
         url = f"https://www.obilet.com/json/journeys/{origin_id}-{destination_id}/{date_str}"
+        print(url)
         
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -155,7 +156,7 @@ class ObiletScraper:
                     "url": url,
                     "country_code": "tr",
                     "render_js": False,
-                    "premium_proxy": True,
+                    "premium_proxy": False,
                 },
                 headers=headers,
                 timeout=30
@@ -165,7 +166,7 @@ class ObiletScraper:
 
             if response.status_code != 200:
                 logger.error(f"❌ ScrapingBee error: {response.status_code}")
-                return []
+                return None  # ❌ API hatası - None döndür
             
             data = response.json()
             journeys = data.get('journeys', [])
@@ -220,17 +221,18 @@ class ObiletScraper:
                 
                 parsed_journeys.append(parsed)
             
+            # ✅ API başarılı - boş liste bile olsa liste döndür
             return parsed_journeys
             
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ Request error: {e}")
-            return []
+            return None  # ❌ Network hatası
         except json.JSONDecodeError as e:
             logger.error(f"❌ JSON parse error: {e}")
-            return []
+            return None  # ❌ Parse hatası
         except Exception as e:
             logger.error(f"❌ Unexpected error: {e}")
-            return 
+            return None  # ❌ Beklenmeyen hata
 
 
     def send_ban_alert(self):
@@ -363,6 +365,19 @@ Action may be required!
                     date_str=date_str
                 )
                 
+                # ❌ API hatası (None döndü) - retry yapılacak
+                if journeys is None:
+                    if attempt == self.max_retries - 1:
+                        logger.error(f"❌ {route_name}: API failed after {self.max_retries} attempts")
+                        with self.lock:
+                            self.failed_routes += 1
+                        return {'success': False, 'api_error': True}
+                    else:
+                        logger.warning(f"⚠️  {route_name}: API error, retrying... (attempt {attempt + 1}/{self.max_retries})")
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                        continue
+                
+                # ✅ API başarılı (boş liste de olabilir)
                 if journeys:
                     # Target date objesini oluştur
                     target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
@@ -385,7 +400,8 @@ Action may be required!
                             self.completed_routes += 1
                         return {'success': True, 'count': 0}
                 else:
-                    logger.warning(f"⚠️  {route_name}: No journeys found")
+                    # ✅ API başarılı ama boş liste (sefer yok)
+                    logger.warning(f"⚠️  {route_name}: No journeys found (API returned empty)")
                     with self.lock:
                         self.completed_routes += 1
                     return {'success': True, 'count': 0}
@@ -404,11 +420,15 @@ Action may be required!
     def get_unique_key(self, journey_data):
         """
         Journey'yi benzersiz şekilde tanımlayan key
-        (route_id, departure_time, partner_id)
+        (route_id, departure_time_iso, partner_id)
         """
+        # Departure'ı parse et ve isoformat'a çevir (DB ile eşleşmesi için)
+        departure_dt = self.parse_datetime_safe(journey_data.get('departure'))
+        departure_iso = departure_dt.isoformat() if departure_dt else None
+        
         return (
             journey_data['route_id'],
-            journey_data.get('departure'),
+            departure_iso,
             journey_data.get('partner_id')
         )
     
@@ -441,7 +461,8 @@ Action may be required!
             available_seats=data.get('available_seats', 0),
             occupancy_rate=occupancy_rate,
             bus_type=data.get('bus_type'),
-            bus_plate=data.get('bus_name'),
+            bus_plate="",
+            #bus_plate=data.get('bus_name'),
             has_wifi='Wifi' in data.get('features', []) or 'Wi-Fi' in data.get('features', []),
             has_usb='USB' in data.get('features', []),
             has_tv='TV' in data.get('features', []) or 'Ekran' in data.get('features', []),
@@ -452,69 +473,70 @@ Action may be required!
 
     def sync_journeys_for_route(self, route_id, new_journeys_data, target_date):
         """
-        Bir route için journey'leri senkronize et (GÜNCELLENMİŞ)
+        Bir route için journey'leri senkronize et - HARD DELETE
+        - API'den gelen güncel data ile DB'deki journeys'leri karşılaştır
+        - API'de olmayan herkesi GERÇEKTEN SİL (hard delete)
+        - is_active kullanmıyoruz artık
         """
         session = get_session()
         
         try:
-            # ❗ DATETIME RANGE DÜZELT
-            # Target date'in başlangıcı ve bitişi (timezone-aware)
-            from datetime import timezone
-            start_of_day = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-            end_of_day = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-            
-            # 1. DB'den o route + tarih için mevcut journeys'i çek
+            # 1. DB'den o route için TÜM journeys'i çek (is_active yok artık)
             existing_journeys = session.query(Journey).filter(
-                Journey.route_id == route_id,
-                Journey.departure_time >= start_of_day,
-                Journey.departure_time <= end_of_day,
-                Journey.is_active == True
+                Journey.route_id == route_id
             ).all()
             
-            # Existing journeys'i key'e göre dict'e çevir
+            # Existing journeys'i obilet_journey_id'ye göre dict'e çevir
             existing_dict = {}
             for j in existing_journeys:
-                key = (
-                    j.route_id,
-                    j.departure_time.isoformat() if j.departure_time else None,
-                    j.obilet_partner_id
-                )
-                existing_dict[key] = j
+                if j.obilet_journey_id:
+                    existing_dict[str(j.obilet_journey_id)] = j
             
-            # New journeys'i key'e göre dict'e çevir
+            # New journeys'i obilet_journey_id'ye göre dict'e çevir
             new_dict = {}
             for data in new_journeys_data:
-                key = self.get_unique_key(data)
-                new_dict[key] = data
+                journey_id = data.get('id')
+                if journey_id:
+                    new_dict[str(journey_id)] = data
             
-            existing_keys = set(existing_dict.keys())
-            new_keys = set(new_dict.keys())
+            existing_ids = set(existing_dict.keys())
+            new_ids = set(new_dict.keys())
             
-            # ... geri kalan sync logic aynı ...
+            logger.info(f"  🔍 Debug: Existing IDs count: {len(existing_ids)}, New IDs count: {len(new_ids)}")
             
-            # 2. Silinecekler
-            to_delete_keys = existing_keys - new_keys
+            # 2. Silinecekler - API'de olmayan herkesi GERÇEKTEN SİL
+            to_delete_ids = existing_ids - new_ids
             deleted_count = 0
             
-            for key in to_delete_keys:
-                journey = existing_dict[key]
-                journey.is_active = False
+            if to_delete_ids:
+                logger.info(f"  🗑️  Will DELETE {len(to_delete_ids)} journeys (hard delete)")
+            
+            for journey_id in to_delete_ids:
+                journey = existing_dict[journey_id]
+                session.delete(journey)  # 🗑️ HARD DELETE
                 deleted_count += 1
-                logger.info(f"  🗑️  Deleted: {journey.company_name} @ {journey.departure_time.strftime('%H:%M') if journey.departure_time else 'N/A'}")
+                logger.info(f"  🗑️  Deleted: {journey.company_name} @ {journey.departure_time.strftime('%Y-%m-%d %H:%M') if journey.departure_time else 'N/A'} (ID: {journey_id})")
             
             # 3. Güncellenecekler
-            to_update_keys = existing_keys & new_keys
+            to_update_ids = existing_ids & new_ids
             updated_count = 0
             price_changes = []
             
-            for key in to_update_keys:
-                existing_journey = existing_dict[key]
-                new_data = new_dict[key]
+            for journey_id in to_update_ids:
+                existing_journey = existing_dict[journey_id]
+                new_data = new_dict[journey_id]
                 
                 new_price = new_data.get('internet_price')
                 new_seats = new_data.get('available_seats', 0)
                 
                 old_price = existing_journey.internet_price
+                
+                # 🔧 Float/Decimal sorunu - hepsini float yap
+                if old_price is not None:
+                    old_price = float(old_price)
+                if new_price is not None:
+                    new_price = float(new_price)
+                
                 price_changed = old_price and new_price and old_price != new_price
                 seats_changed = existing_journey.available_seats != new_seats
                 
@@ -541,17 +563,19 @@ Action may be required!
                         })
                         logger.info(f"  💰 Price changed: {existing_journey.company_name} @ {existing_journey.departure_time.strftime('%H:%M') if existing_journey.departure_time else 'N/A'} | {old_price} → {new_price} TRY ({change_pct:+.1f}%)")
             
-            # 4. Eklenecekler
-            to_insert_keys = new_keys - existing_keys
+            # 4. Eklenecekler - Gerçekten yeni olanları ekle
+            to_insert_ids = new_ids - existing_ids
             inserted_journeys = []
             
-            for key in to_insert_keys:
-                new_data = new_dict[key]
+            if to_insert_ids:
+                logger.info(f"  ➕ Will insert {len(to_insert_ids)} new journeys")
+            
+            for journey_id in to_insert_ids:
+                new_data = new_dict[journey_id]
                 journey_obj = self.create_journey_object(new_data)
                 session.add(journey_obj)
                 inserted_journeys.append(journey_obj)
-                
-                logger.info(f"  ➕ New journey: {journey_obj.company_name} @ {journey_obj.departure_time.strftime('%H:%M') if journey_obj.departure_time else 'N/A'} | {journey_obj.internet_price} TRY")
+                logger.info(f"  ➕ New journey: {journey_obj.company_name} @ {journey_obj.departure_time.strftime('%H:%M') if journey_obj.departure_time else 'N/A'} | {journey_obj.internet_price} TRY (ID: {journey_id})")
             
             session.commit()
             
@@ -564,10 +588,10 @@ Action may be required!
                 target_date=target_date
             )
             
-            logger.info(f"  📊 Route {route_id} sync: {len(to_insert_keys)} inserted, {updated_count} updated, {deleted_count} deleted")
+            logger.info(f"  📊 Route {route_id} sync: {len(to_insert_ids)} inserted, {updated_count} updated, {deleted_count} deleted")
             
             return {
-                'inserted': len(to_insert_keys),
+                'inserted': len(to_insert_ids),
                 'updated': updated_count,
                 'deleted': deleted_count,
                 'price_changes': len(price_changes)
@@ -708,7 +732,7 @@ Action may be required!
         finally:
             session.close()
     
-    def cleanup_old_data(self, days_to_keep=30):
+    def cleanup_old_data(self, days_to_keep=0):
         """
         Eski verileri temizle
         - Journey: is_active=False ve eski olanları sil
@@ -795,15 +819,16 @@ Action may be required!
                     # Scraping sonucu
                     result = future.result()
                     
-                    if result['success'] and result.get('count', 0) > 0:
-                        # Bu route için scraped journeys'i al
+                    # ✅ API başarılı - boş liste de olabilir
+                    if result['success']:
+                        # Bu route için scraped journeys'i al (boş liste olabilir)
                         route_journeys = [
                             j for j in self.scraped_data 
                             if j['route_id'] == route.id
                         ]
                         
-                        # Sync yap
-                        logger.info(f"\n🔄 Syncing route {route.id}: {route.route_name or 'N/A'}")
+                        # Sync yap - API başarılıysa boş bile olsa sync et
+                        logger.info(f"\n🔄 Syncing route {route.id}: {route.route_name or 'N/A'} ({len(route_journeys)} journeys)")
                         sync_result = self.sync_journeys_for_route(
                             route_id=route.id,
                             new_journeys_data=route_journeys,
@@ -815,8 +840,12 @@ Action may be required!
                         total_deleted += sync_result['deleted']
                         total_price_changes += sync_result['price_changes']
                         
-                        # Price History ekle
-                        self.insert_price_history_for_route(route_journeys, target_date)
+                        # Price History ekle (sadece veri varsa)
+                        if route_journeys:
+                            self.insert_price_history_for_route(route_journeys, target_date)
+                    else:
+                        # ❌ API hatası - eski verileri koru (sync yapma)
+                        logger.warning(f"⚠️  Route {route.id} skipped sync (API error - preserving old data)")
                     
                 except Exception as e:
                     logger.error(f"❌ Error processing route {route.id}: {e}")
@@ -855,8 +884,8 @@ if __name__ == '__main__':
     
     # Scraper çalıştır
     scraper = ObiletScraper(
-        max_workers=5,
-        max_retries=3,
+        max_workers=4,
+        max_retries=10,
         batch_size=500
     )
     
