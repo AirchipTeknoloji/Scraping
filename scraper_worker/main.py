@@ -895,4 +895,4 @@ if __name__ == '__main__':
     scraped_data = scraper.run(cleanup_old_data=True)
     
     logger.info("\n🎉 All operations completed successfully!")
-    sys.exit(code)
+    sys.exit(0)
