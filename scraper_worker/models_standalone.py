@@ -37,6 +37,10 @@ class User(Base):
     email = Column(String(200), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
     phone = Column(String(20))
+
+    # External IDs (BIGINT for 64-bit integers)
+    telegram_id = Column(BigInteger, unique=True, nullable=True, index=True)  # Telegram User ID
+    extra_id = Column(BigInteger, unique=True, nullable=True, index=True)     # Extra external ID
     
     # Role & Permissions
     role = Column(String(20), nullable=False, default='company', index=True)  # 'admin' or 'company'
