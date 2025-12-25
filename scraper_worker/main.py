@@ -26,10 +26,114 @@ from models_standalone import (
 #logger = logging.getLogger(__name__)
 
 # ScrapingBee API Key
-API_KEY = os.getenv('SCRAPINGBEE_API_KEY', '1BK95SF6JYACP830LL46SNQWJZZYZVMF6QS04DHBLE6QAIZNPVGO30O5CRN9HUMMNX6LC6FML1KJSDOE')
+API_KEY = os.getenv('SCRAPINGBEE_API_KEY', '')
+
+# Telegram Config
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
 
 
+def send_telegram_message(message: str, chat_id: str = None, parse_mode: str = 'HTML') -> bool:
+    """
+    Telegram üzerinden mesaj gönder
+    chat_id belirtilmezse varsayılan TELEGRAM_CHAT_ID kullanılır (admin bildirimleri için)
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        logger.warning("⚠️ Telegram bot token not configured")
+        return False
+    
+    target_chat_id = chat_id or TELEGRAM_CHAT_ID
+    
+    if not target_chat_id:
+        logger.warning("⚠️ No chat_id provided and TELEGRAM_CHAT_ID not configured")
+        return False
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': target_chat_id,
+            'text': message,
+            'parse_mode': parse_mode
+        }
+        
+        response = requests.post(url, json=payload, timeout=10)
+        
+        if response.status_code == 200:
+            logger.info(f"✅ Telegram message sent to {target_chat_id}")
+            return True
+        else:
+            logger.error(f"❌ Telegram API error: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Failed to send Telegram message: {e}")
+        return False
+
+
+def send_price_alert_telegram(user, route_name: str, change: dict) -> bool:
+    """
+    Kullanıcıya fiyat değişikliği Telegram bildirimi gönder
+    """
+    # Kullanıcının telegram_id'si yoksa gönderme
+    if not user.telegram_id:
+        return False
+    
+    journey = change['journey']
+    old_price = change['old_price']
+    new_price = change['new_price']
+    change_pct = change['change_pct']
+    
+    # Emoji ve mesaj türü
+    if change_pct < 0:
+        emoji = "📉"
+        title = "Fiyat Düştü!"
+    else:
+        emoji = "📈"
+        title = "Fiyat Arttı!"
+    
+    departure_time = journey.departure_time.strftime('%H:%M') if journey.departure_time else 'N/A'
+    departure_date = journey.departure_time.strftime('%d.%m.%Y') if journey.departure_time else 'N/A'
+    
+    message = f"""
+{emoji} <b>{title}</b>
+
+🚌 <b>Firma:</b> {journey.company_name}
+🛣 <b>Güzergah:</b> {route_name}
+📅 <b>Tarih:</b> {departure_date}
+🕐 <b>Saat:</b> {departure_time}
+
+💰 <b>Eski Fiyat:</b> {old_price:.2f} TRY
+💰 <b>Yeni Fiyat:</b> {new_price:.2f} TRY
+📊 <b>Değişim:</b> {change_pct:+.1f}%
+""".strip()
+    
+    return send_telegram_message(message, chat_id=str(user.telegram_id))
+
+
+def send_new_journey_telegram(user, route_name: str, journey, is_lowest_price: bool = False) -> bool:
+    """
+    Kullanıcıya yeni sefer Telegram bildirimi gönder
+    """
+    if not user.telegram_id:
+        return False
+    
+    departure_time = journey.departure_time.strftime('%H:%M') if journey.departure_time else 'N/A'
+    departure_date = journey.departure_time.strftime('%d.%m.%Y') if journey.departure_time else 'N/A'
+    
+    lowest_badge = "\n🏆 <b>EN DÜŞÜK FİYAT!</b>" if is_lowest_price else ""
+    
+    message = f"""
+🆕 <b>Yeni Sefer Eklendi!</b>
+
+🚌 <b>Firma:</b> {journey.company_name}
+🛣 <b>Güzergah:</b> {route_name}
+📅 <b>Tarih:</b> {departure_date}
+🕐 <b>Saat:</b> {departure_time}
+💰 <b>Fiyat:</b> {journey.internet_price:.2f} TRY{lowest_badge}
+""".strip()
+    
+    return send_telegram_message(message, chat_id=str(user.telegram_id))
 
 
 # Logging konfigürasyonu - STDOUT'a yaz (DigitalOcean logları görebilmek için)
@@ -106,7 +210,7 @@ class ScrapingBeeMonitor:
 
 
 class ObiletScraper:
-    def __init__(self, max_workers=4, max_retries=10, batch_size=500):
+    def __init__(self, max_workers=5, max_retries=10, batch_size=500):
         self.max_workers = max_workers
         self.max_retries = max_retries
         self.batch_size = batch_size
@@ -119,6 +223,7 @@ class ObiletScraper:
         self.total_routes = 0
         self.completed_routes = 0
         self.failed_routes = 0
+        self.failed_routes_list = []  # Başarısız rotaların listesi
         self.total_journeys = 0
         self.ban_monitor = ScrapingBeeMonitor()
         
@@ -157,9 +262,11 @@ class ObiletScraper:
                     "country_code": "tr",
                     "render_js": False,
                     "premium_proxy": False,
+                    "forward_headers":True,
+                    "timeout": 60000,  # 60 saniye (büyük JSON'lar için)
                 },
                 headers=headers,
-                timeout=30
+                timeout=70  # Request timeout (ScrapingBee timeout'undan biraz fazla)
             )
 
             self.ban_monitor.record_request(response)
@@ -371,6 +478,7 @@ Action may be required!
                         logger.error(f"❌ {route_name}: API failed after {self.max_retries} attempts")
                         with self.lock:
                             self.failed_routes += 1
+                            self.failed_routes_list.append(route_name)  # Başarısız rota listesine ekle
                         return {'success': False, 'api_error': True}
                     else:
                         logger.warning(f"⚠️  {route_name}: API error, retrying... (attempt {attempt + 1}/{self.max_retries})")
@@ -580,12 +688,19 @@ Action may be required!
             session.commit()
             
             # 5. Alert oluştur
+            # Eğer DB'de hiç journey yoktuysa = günün ilk dolumu = yeni sefer bildirimi gönderme
+            is_first_run = len(existing_ids) == 0
+            
+            if is_first_run:
+                logger.info(f"  ℹ️  First run for route {route_id} - skipping new journey notifications")
+            
             self.create_alerts_for_changes(
                 session=session,
                 route_id=route_id,
                 price_changes=price_changes,
                 new_journeys=inserted_journeys,
-                target_date=target_date
+                target_date=target_date,
+                skip_new_journey_alerts=is_first_run  # İlk dolumda yeni sefer bildirimi gönderme
             )
             
             logger.info(f"  📊 Route {route_id} sync: {len(to_insert_ids)} inserted, {updated_count} updated, {deleted_count} deleted")
@@ -604,11 +719,22 @@ Action may be required!
         finally:
             session.close()
         
-    def create_alerts_for_changes(self, session, route_id, price_changes, new_journeys, target_date):
+    def create_alerts_for_changes(self, session, route_id, price_changes, new_journeys, target_date, skip_new_journey_alerts=False):
         """
-        Fiyat değişiklikleri ve yeni seferler için alert oluştur
+        Fiyat değişiklikleri ve yeni seferler için:
+        - PriceAlert tablosuna kaydet
+        - Notification tablosuna kaydet
+        - Telegram bildirimi gönder
+        
+        skip_new_journey_alerts: True ise yeni sefer bildirimi gönderilmez (günün ilk dolumu için)
         """
+        from models_standalone import Notification
+        
         try:
+            # Route bilgisini al
+            route = session.query(Route).filter(Route.id == route_id).first()
+            route_name = route.route_name if route else f"Route {route_id}"
+            
             # Bu route'u takip eden firmaları bul
             company_routes = session.query(CompanyRoute).filter(
                 CompanyRoute.route_id == route_id,
@@ -622,51 +748,74 @@ Action may be required!
             for cr in company_routes:
                 user = cr.user
                 
-                # Fiyat değişikliği alertleri
-                if cr.alert_on_price_change:
-                    for change in price_changes:
-                        # Threshold kontrolü
-                        if abs(change['change_pct']) >= float(cr.alert_threshold_percentage or 0):
-                            
-                            alert_type = 'price_drop' if change['change_pct'] < 0 else 'price_increase'
-                            
-                            alert = PriceAlert(
-                                user_id=user.id,
-                                route_id=route_id,
-                                alert_type=alert_type,
-                                title=f"{'Fiyat Düştü' if alert_type == 'price_drop' else 'Fiyat Arttı'}: {change['journey'].company_name}",
-                                message=f"{change['journey'].company_name} firmasının {change['journey'].departure_time.strftime('%H:%M') if change['journey'].departure_time else 'N/A'} seferinde fiyat {change['old_price']} TRY'den {change['new_price']} TRY'ye değişti ({change['change_pct']:+.1f}%)",
-                                competitor_name=change['journey'].company_name,
-                                old_price=change['old_price'],
-                                new_price=change['new_price'],
-                                price_change_percentage=change['change_pct'],
-                                departure_date=target_date,
-                                priority='high' if abs(change['change_pct']) > 20 else 'medium',
-                                is_read=False,
-                                is_sent=False
-                            )
-                            session.add(alert)
-                            logger.info(f"    🔔 Alert created for user {user.company_name}: Price change")
+                # Fiyat değişikliği alertleri - KONTROL YOK, her değişiklikte bildirim
+                for change in price_changes:
+                    alert_type = 'price_drop' if change['change_pct'] < 0 else 'price_increase'
+                    emoji = '📉' if change['change_pct'] < 0 else '📈'
+                    title = f"{'Fiyat Düştü' if alert_type == 'price_drop' else 'Fiyat Arttı'}: {change['journey'].company_name}"
+                    message = f"{change['journey'].company_name} firmasının {change['journey'].departure_time.strftime('%H:%M') if change['journey'].departure_time else 'N/A'} seferinde fiyat {change['old_price']:.2f} TRY'den {change['new_price']:.2f} TRY'ye değişti ({change['change_pct']:+.1f}%)"
+                    
+                    # 1. PriceAlert tablosuna kaydet
+                    alert = PriceAlert(
+                        user_id=user.id,
+                        route_id=route_id,
+                        alert_type=alert_type,
+                        title=title,
+                        message=message,
+                        competitor_name=change['journey'].company_name,
+                        old_price=change['old_price'],
+                        new_price=change['new_price'],
+                        price_change_percentage=change['change_pct'],
+                        departure_date=target_date,
+                        priority='high' if abs(change['change_pct']) > 20 else 'medium',
+                        is_read=False,
+                        is_sent=False
+                    )
+                    session.add(alert)
+                    
+                    # 2. Notification tablosuna kaydet
+                    notification = Notification(
+                        user_id=user.id,
+                        title=f"{emoji} {title}",
+                        message=message,
+                        notification_type='price_change',
+                        priority='high' if abs(change['change_pct']) > 20 else 'medium',
+                        is_read=False
+                    )
+                    session.add(notification)
+                    
+                    logger.info(f"    🔔 Alert + Notification created for {user.company_name}: Price change")
+                    
+                    # 3. Telegram Bildirimi Gönder (telegram_id varsa)
+                    if user.telegram_id:
+                        send_price_alert_telegram(user, route_name, change)
+                        logger.info(f"    📱 Telegram sent to {user.company_name}")
                 
-                # Yeni sefer alertleri
+                # Yeni sefer alertleri - Günün ilk dolumunda GÖNDERME
+                if skip_new_journey_alerts:
+                    continue  # Bu kullanıcı için yeni sefer bildirimi atla
+                
                 for new_journey in new_journeys:
                     # En düşük fiyatlı mı kontrol et
                     min_price_journey = session.query(Journey).filter(
                         Journey.route_id == route_id,
-                        Journey.departure_time >= target_date,
-                        Journey.departure_time < target_date + timedelta(days=1),
-                        Journey.is_active == True
+                        Journey.departure_time >= datetime.combine(target_date, datetime.min.time()),
+                        Journey.departure_time < datetime.combine(target_date + timedelta(days=1), datetime.min.time())
                     ).order_by(Journey.internet_price.asc()).first()
                     
                     is_lowest_price = (min_price_journey and 
                                       new_journey.internet_price == min_price_journey.internet_price)
                     
+                    title = f"Yeni Sefer Eklendi: {new_journey.company_name}"
+                    message = f"{new_journey.company_name} firması {new_journey.departure_time.strftime('%H:%M') if new_journey.departure_time else 'N/A'} seferini ekledi. Fiyat: {new_journey.internet_price} TRY" + (" - EN DÜŞÜK FİYAT! 🎉" if is_lowest_price else "")
+                    
+                    # 1. PriceAlert tablosuna kaydet
                     alert = PriceAlert(
                         user_id=user.id,
                         route_id=route_id,
                         alert_type='new_journey',
-                        title=f"Yeni Sefer Eklendi: {new_journey.company_name}",
-                        message=f"{new_journey.company_name} firması {new_journey.departure_time.strftime('%H:%M') if new_journey.departure_time else 'N/A'} seferini ekledi. Fiyat: {new_journey.internet_price} TRY" + (" - EN DÜŞÜK FİYAT! 🎉" if is_lowest_price else ""),
+                        title=title,
+                        message=message,
                         competitor_name=new_journey.company_name,
                         new_price=new_journey.internet_price,
                         departure_date=target_date,
@@ -675,7 +824,24 @@ Action may be required!
                         is_sent=False
                     )
                     session.add(alert)
-                    logger.info(f"    🔔 Alert created for user {user.company_name}: New journey")
+                    
+                    # 2. Notification tablosuna kaydet
+                    notification = Notification(
+                        user_id=user.id,
+                        title=f"🆕 {title}",
+                        message=message,
+                        notification_type='new_journey',
+                        priority='high' if is_lowest_price else 'low',
+                        is_read=False
+                    )
+                    session.add(notification)
+                    
+                    logger.info(f"    🔔 Alert + Notification created for {user.company_name}: New journey")
+                    
+                    # 3. Telegram Bildirimi Gönder (telegram_id varsa)
+                    if user.telegram_id:
+                        send_new_journey_telegram(user, route_name, new_journey, is_lowest_price)
+                        logger.info(f"    📱 Telegram sent to {user.company_name}: New journey")
             
             session.commit()
             
@@ -763,6 +929,36 @@ Action may be required!
         finally:
             session.close()
     
+    def cleanup_past_journeys(self, target_date):
+        """
+        Geçmiş günlere ait TÜM journey'leri sil
+        Bu sayede günün ilk scrape'inde DB boş olur ve 
+        yeni sefer bildirimi gönderilmez
+        """
+        session = get_session()
+        
+        try:
+            # Bugünün başlangıcı (00:00:00)
+            today_start = datetime.combine(target_date, datetime.min.time())
+            
+            # Bugünden önceki TÜM journey'leri sil (HARD DELETE)
+            deleted_count = session.query(Journey).filter(
+                Journey.departure_time < today_start
+            ).delete()
+            
+            session.commit()
+            
+            if deleted_count > 0:
+                logger.info(f"🗑️  Deleted {deleted_count} past journeys (before {target_date})")
+            else:
+                logger.info(f"✅ No past journeys to delete")
+            
+        except Exception as e:
+            session.rollback()
+            logger.error(f"❌ Cleanup past journeys error: {e}")
+        finally:
+            session.close()
+    
     def run(self, target_date=None, cleanup_old_data=False):
         """
         Ana scraping + sync fonksiyonu
@@ -776,7 +972,6 @@ Action may be required!
         # Target date (default: bugün)
         if not target_date:
             target_date = date.today()
-            print(target_date)
         
         date_str = target_date.strftime('%Y-%m-%d')
         logger.info(f"📅 Target Date: {date_str}")
@@ -786,6 +981,9 @@ Action may be required!
             logger.info("\n🧹 Cleaning up old data...")
             self.cleanup_old_data(days_to_keep=30)
             logger.info("")
+        
+        # 🗑️ Geçmiş günlere ait TÜM journey'leri sil (günün ilk dolumu için)
+        self.cleanup_past_journeys(target_date)
         
         # Database'den route'ları çek
         routes = self.get_active_routes()
@@ -873,20 +1071,59 @@ Action may be required!
         logger.info(f"      Price Changes: {total_price_changes}")
         logger.info("=" * 80)
         
+        # 📱 Telegram Bildirimi Gönder
+        status_emoji = "✅" if self.failed_routes == 0 else "⚠️"
+        
+        # Tarih ve saat bilgisi
+        now = datetime.now()
+        datetime_str = now.strftime('%Y-%m-%d %H:%M')
+        
+        telegram_message = f"""
+{status_emoji} <b>Scraper Tamamlandı</b>
+
+📅 <b>Tarih:</b> {datetime_str}
+🎯 <b>Hedef:</b> {target_date.strftime('%Y-%m-%d')}
+⏱ <b>Süre:</b> {elapsed:.1f}s
+
+📊 <b>Route İstatistikleri:</b>
+• İşlenen: {self.completed_routes}/{self.total_routes}
+• Başarısız: {self.failed_routes}
+• Toplam Journey: {self.total_journeys}
+
+💾 <b>Database Değişiklikleri:</b>
+• Eklenen: {total_inserted}
+• Güncellenen: {total_updated}
+• Silinen: {total_deleted}
+• Fiyat Değişimi: {total_price_changes}
+""".strip()
+        
+        # Başarısız rotaları ekle
+        if self.failed_routes_list:
+            failed_routes_text = "\n".join([f"  • {r}" for r in self.failed_routes_list[:10]])  # Max 10 tane göster
+            telegram_message += f"\n\n❌ <b>Başarısız Rotalar:</b>\n{failed_routes_text}"
+            if len(self.failed_routes_list) > 10:
+                telegram_message += f"\n  ... ve {len(self.failed_routes_list) - 10} rota daha"
+        
+        # Block rate uyarısı ekle
+        if self.ban_monitor.get_block_rate() > 5:
+            telegram_message += f"\n\n🚨 <b>UYARI:</b> Block rate yüksek! ({self.ban_monitor.get_block_rate():.1f}%)"
+        
+        send_telegram_message(telegram_message)
+        
         return self.scraped_data
 
 
 if __name__ == '__main__':
     # Database URL check
-    if not os.getenv('DATABASE_URL', 'postgresql://doadmin:AVNS_zd8YbZpiFc5dU9HRIc3@db-postgresql-fra1-91466-do-user-30609413-0.i.db.ondigitalocean.com:25060/defaultdb?sslmode=require'):
+    if not os.getenv('DATABASE_URL', ''):
         logger.error("❌ DATABASE_URL environment variable not set!")
         logger.info("Usage: export DATABASE_URL='postgresql://user:pass@host:5432/dbname'")
         exit(1)
     
     # Scraper çalıştır
     scraper = ObiletScraper(
-        max_workers=4,
-        max_retries=10,
+        max_workers=10,
+        max_retries=20,
         batch_size=500
     )
     
@@ -895,4 +1132,3 @@ if __name__ == '__main__':
     scraped_data = scraper.run(cleanup_old_data=True)
     
     logger.info("\n🎉 All operations completed successfully!")
-    sys.exit(0)
