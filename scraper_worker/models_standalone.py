@@ -7,7 +7,7 @@ NOT: Bu dosya models.py'nin kopyasıdır.
 Her migration'dan sonra models.py'den sync edilmelidir.
 """
 
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Numeric, Text, Date, ForeignKey, JSON, CheckConstraint, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Numeric, Text, Date, ForeignKey, JSON, CheckConstraint, UniqueConstraint, BigInteger
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
