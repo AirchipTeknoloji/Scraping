@@ -273,6 +273,7 @@ class ObiletScraper:
 
             if response.status_code != 200:
                 logger.error(f"❌ ScrapingBee error: {response.status_code}")
+                logger.error(f"❌ ScrapingBee error: {response.content}")
                 return None  # ❌ API hatası - None döndür
             
             data = response.json()
@@ -1123,7 +1124,7 @@ if __name__ == '__main__':
     # Scraper çalıştır
     scraper = ObiletScraper(
         max_workers=10,
-        max_retries=20,
+        max_retries=10,
         batch_size=500
     )
     
